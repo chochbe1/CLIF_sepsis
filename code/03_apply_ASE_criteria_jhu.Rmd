@@ -1,0 +1,288 @@
+---
+title: "Apply CDC Sepsis Event Criteria using the CLIF format"
+output: html_notebook
+---
+
+# Required packages
+```{r}
+library(here)
+library(tidyverse)
+library(arrow)
+```
+
+```{r}
+# Load the configuration utility and the path to the study cohort
+source(here("utils/config.R"))
+
+site_name <- config$site_name
+tables_path <- file.path(config$tables_path, "sepsis_study_cohort")
+```
+
+# Identify Adult Sepsis Event per CDC criteria
+This code applies the [CDC adverse sepsis event defintion ](https://www.cdc.gov/sepsis/pdfs/sepsis-surveillance-toolkit-mar-2018_508.pdf) to CLIF
+
+(Must include the 2 components of criteria A **AND** include one or more organ dysfunction listed among B criteria)
+
+## A. Presumed Infection (presence of both 1 and 2):
+
+### **Blood culture obtained** (irrespective of the result)
+
+```{r}
+# Step 1: Load and filter blood cultures data with specific columns, defining blood_culture_day
+blood_cultures <- open_dataset(file.path(tables_path, "clif_microbiology_culture_cohort.parquet")) %>%
+  filter(tolower(fluid_category) == "blood/buffy coat") %>%
+  select(hospitalization_id, collect_dttm, fluid_category) %>%
+  rename(blood_culture_collect_time = collect_dttm) %>%
+  distinct() %>%
+  compute()
+```
+
+### **At least 4 Qualifying Antimicrobial Days (QAD)** – starting within the time period 2 calendar days before and after the collection date of a blood culture.
+```{r}
+# Step 2: Load and filter qualifying antibiotic days, keeping times in exact datetime format
+qualifying_antibiotic_days <- open_dataset(file.path(tables_path, "clif_medication_admin_intermittent_cohort.parquet")) %>%
+  filter(med_group == "qualifying_CMS_antibiotics") %>%
+  select(hospitalization_id, admin_dttm) %>%
+  rename(time = admin_dttm) %>%
+  compute()
+
+# Step 3: Join with blood culture data and calculate QAD using relative day definitions
+qualifying_antibiotic_days <- qualifying_antibiotic_days %>%
+  left_join(blood_cultures %>% select(hospitalization_id, blood_culture_collect_time)) %>%
+  collect() %>%
+  mutate(
+    # Calculate the difference in hours between antibiotic time and blood culture collection time
+    hour_diff = as.numeric(difftime(time, blood_culture_collect_time, units = "hours")),
+    # Define relative days based on hour difference
+    day = floor(hour_diff/24))%>%
+  arrange(hospitalization_id, blood_culture_collect_time, hour_diff, day) %>%
+  select(hospitalization_id, blood_culture_collect_time, day) %>%
+  distinct() %>%
+  filter(day >= -2 & day <= 6) %>%
+  group_by(hospitalization_id, blood_culture_collect_time) %>%
+  summarise(total_QAD = n()) %>%# Count qualifying days per blood culture collection
+  filter(total_QAD >=4)
+
+# Step 4: Load death times and join with essential fields
+death_times <- open_dataset(file.path(tables_path, "clif_hospitalization_cohort.parquet")) %>%
+  select(hospitalization_id, patient_id) %>%
+  left_join(
+    open_dataset(file.path(tables_path, "clif_patient_cohort.parquet")) %>%
+      select(patient_id, death_dttm),
+    by = "patient_id"
+  ) %>%
+  select(hospitalization_id, death_dttm) %>%
+  collect()
+
+# Step 5: Determine presumed infection based on QAD and death timing, using blood_culture_collect_time as dttm
+presumed_infection <- qualifying_antibiotic_days %>%
+  left_join(death_times, by = "hospitalization_id") %>%
+  mutate(
+    presumed_infection = ifelse(
+      total_QAD >= 4 | (total_QAD >= 1 & !is.na(death_dttm) & death_dttm < (blood_culture_collect_time + days(4))), 
+      1, 0
+    )
+  ) %>%
+  filter(presumed_infection == 1) %>%
+  select(hospitalization_id, time = blood_culture_collect_time) %>%
+  arrange(hospitalization_id, time) %>%
+  distinct()
+rm(qualifying_antibiotic_days, death_times)
+```
+
+
+**AND**
+
+## B. Organ Dysfunction (at least 1 of the following criteria met within the time period 2 calendar days before and after the collection date of a blood culture):
+
+### **Initiation of a new vasopressor infusion** (norepinephrine, dopamine, epinephrine, phenylephrine, OR vasopressin). To count as a new vasopressor, that specific vasopressor cannot have been administered in the prior calendar day. See Appendix B.
+
+```{r}
+# Step 1: Load and filter continuous medication administration data, then collect into memory
+long_sepsis_vasoactives <- open_dataset(file.path(tables_path, "clif_medication_admin_continuous_cohort.parquet")) %>%
+  filter(med_category %in% c("norepinephrine", "epinephrine", 
+                             "phenylephrine", "vasopressin", "dopamine", "angiotensin") & 
+         med_dose > 0) %>%
+  select(hospitalization_id, admin_dttm, med_category, med_dose) %>%
+  rename(time = admin_dttm) %>%
+  collect()  # Collect data into memory
+
+# Step 2: Join with presumed infection data (already collected in memory) and perform date arithmetic
+long_sepsis_vasoactives <- long_sepsis_vasoactives %>%
+  left_join(presumed_infection %>% select(hospitalization_id, presumed_infection_dttm = time), 
+            by = "hospitalization_id") %>%
+  mutate(qualifying_vasoactive_start = ifelse(
+    time > (presumed_infection_dttm - lubridate::days(2)) & 
+    time < (presumed_infection_dttm + lubridate::days(2)), 
+    1, 0
+  )) %>%
+  select(hospitalization_id, time, presumed_infection_dttm, med_dose, med_category, qualifying_vasoactive_start)
+```
+
+###  **Initiation of invasive mechanical ventilation** (must be greater than 1 calendar day between mechanical ventilation episodes). Invasive mechanical ventilation can be identified by:
+    -   ICD-10 Procedure Codes: 5A1935Z, 5A1945Z, 5A1955Z
+    -   CPT codes: 94002, 94003, 94004, 94656, 94657
+    -   Other clinical records.
+
+We are using the "other clinical records" of mechanical ventilation in the flowsheets, which are sent from the ventilator to the EHR and confirmed by the RT. This allows for much more precise determination of timing than ICD-10 or CPT codes, which are entered asynchronously 
+
+```{r}
+# Step 1: Load and filter respiratory support data for IMV, then collect into memory
+long_sepsis_IMV <- open_dataset(file.path(tables_path, "clif_respiratory_support_cohort.parquet")) %>%
+  filter(device_category == "IMV") %>%
+  select(hospitalization_id, recorded_dttm, device_category) %>%
+  rename(time = recorded_dttm) %>%
+  collect()  # Collect data into memory
+
+# Step 2: Convert hospitalization_id to character and join with presumed infection data, then perform date arithmetic
+long_sepsis_IMV <- long_sepsis_IMV %>%
+  #mutate(hospitalization_id = as.character(hospitalization_id)) %>%
+  left_join(presumed_infection %>% select(hospitalization_id, presumed_infection_dttm = time), 
+            by = "hospitalization_id") %>%
+  mutate(qualifying_vent_start = ifelse(
+    time > (presumed_infection_dttm - lubridate::days(2)) & 
+    time < (presumed_infection_dttm + lubridate::days(2)), 
+    1, 0
+  )) %>%
+  select(hospitalization_id, time, presumed_infection_dttm, device_category, qualifying_vent_start)
+```
+
+
+## Lab criteria
+```{r}
+long_sepsis_labs <- open_dataset(file.path(tables_path, "clif_labs_cohort.parquet")) %>%
+  filter(lab_category %in% c("lactate", "creatinine", "bilirubin_total", "platelet_count")) %>%
+  select(hospitalization_id, lab_category, lab_value_numeric, lab_result_dttm) %>%
+  rename(time = lab_result_dttm) %>%
+  collect()  # Collect data into memory
+```
+
+* **Doubling of serum creatinine** OR decrease by ≥50% of estimated glomerular filtration rate (eGFR) relative to baseline (see below), excluding patients with ICD-10 code for end-stage renal disease (N18.6). (If eGFR values are not readily available, creatinine alone can be used to determine renal dysfunction).
+* **Total bilirubin ≥ 2.0 mg/dL** and increase by 100% from baseline (see below).
+* **Platelet count \<100 cells/μL** AND ≥50% decline from baseline (see below) – baseline must be ≥100 cells/μL.
+* **Optional**: Serum lactate ≥ 2.0 mmol/L. Note that serum lactate has become an increasingly common test to measure tissue perfusion. When serum lactate is included in the surveillance definition, the likely effect will be to slightly increase the number of sepsis cases identified. However, if serum lactate ordering practices are not stable over time in a particular hospital, this will bias the incidence of sepsis. For this reason, serum lactate was not used in the primary analysis of sepsis trends over time in the original study by Rhee et al.
+
+### NOTE: need to add `clif_admission_diagnosis` table to exclude patients with ICD-10 code for ESRD from meeting sepsis criteria based on creatinine
+```{r}
+# Baseline for creatinine
+baseline_creatinine <- long_sepsis_labs %>%
+  filter(lab_category == "creatinine") %>%
+  group_by(hospitalization_id) %>%
+  arrange(time) %>%
+  filter(row_number() == 1) %>%
+  ungroup() %>%
+  select(hospitalization_id, baseline_creatinine = lab_value_numeric)
+
+# Baseline for bilirubin
+baseline_bilirubin <- long_sepsis_labs %>%
+  filter(lab_category == "bilirubin_total") %>%
+  group_by(hospitalization_id) %>%
+  arrange(time) %>%
+  filter(row_number() == 1) %>%
+  ungroup() %>%
+  select(hospitalization_id, baseline_bilirubin_total = lab_value_numeric)
+
+# Baseline for platelet count
+baseline_platelet <- long_sepsis_labs %>%
+  filter(lab_category == "platelet_count") %>%
+  group_by(hospitalization_id) %>%
+  arrange(time) %>%
+  filter(row_number() == 1) %>%
+  ungroup() %>%
+  select(hospitalization_id, baseline_platelet_count = lab_value_numeric)
+```
+
+```{r}
+# Join long_sepsis_labs with each baseline and identify organ dysfunction criteria
+long_sepsis_labs_w_sepsis_flags <- long_sepsis_labs %>%
+  #mutate(hospitalization_id = as.character(hospitalization_id)) %>%
+  
+  # Join with baseline data frames for each lab category
+  left_join(baseline_creatinine, by = "hospitalization_id") %>%
+  left_join(baseline_bilirubin, by = "hospitalization_id") %>%
+  left_join(baseline_platelet, by = "hospitalization_id") %>%
+  
+  # Calculate organ dysfunction criteria
+  mutate(
+    # Doubling of serum creatinine
+    creatinine_change = ifelse(lab_category == "creatinine", lab_value_numeric / baseline_creatinine, NA),
+    aki = ifelse(creatinine_change >= 2, 1, 0),
+    
+    # Total bilirubin ≥ 2.0 mg/dL and increase by 100%
+    bilirubin_change = ifelse(lab_category == "bilirubin_total", lab_value_numeric / baseline_bilirubin_total, NA),
+    hyperbilirubinemia = ifelse(lab_category == "bilirubin_total" & lab_value_numeric >= 2 & bilirubin_change >= 2, 1, 0),
+    
+    # Platelet count <100 cells/μL AND ≥50% decline from baseline
+    platelet_change = ifelse(lab_category == "platelet_count", lab_value_numeric / baseline_platelet_count, NA),
+    thrombocytopenia = ifelse(lab_category == "platelet_count" & lab_value_numeric < 100 & platelet_change <= 0.5, 1, 0)
+  ) %>%
+  
+  # Join with presumed infection data for infection timing
+  left_join(presumed_infection %>% select(hospitalization_id, presumed_infection_dttm = time), 
+            by = "hospitalization_id") %>%
+  
+  # Determine if the lab results qualify for sepsis within the infection window
+  mutate(
+    # Creatinine qualifying within infection window
+    qualifying_aki = ifelse(aki == 1 & time > presumed_infection_dttm - lubridate::days(2) & time < presumed_infection_dttm + lubridate::days(2), 1, 0),
+    
+    # Bilirubin qualifying within infection window
+    qualifying_hyperbilirubinemia = ifelse(hyperbilirubinemia == 1 & time > presumed_infection_dttm - lubridate::days(2) & time < presumed_infection_dttm + lubridate::days(2), 1, 0),
+    
+    # Platelet qualifying within infection window
+    qualifying_thrombocytopenia = ifelse(thrombocytopenia == 1 & time > presumed_infection_dttm - lubridate::days(2) & time < presumed_infection_dttm + lubridate::days(2), 1, 0),
+    
+    # Lactate qualifying within infection window
+    qualifying_lactate = ifelse(lab_category == "lactate" & 
+                                  lab_value_numeric >= 2 & 
+                                  time > presumed_infection_dttm - lubridate::days(2) & time < presumed_infection_dttm + lubridate::days(2), 1, 0)
+  )
+```
+
+# wide format for sepsis evaluation of meeting part B definitions
+```{r}
+sepsis_times <- long_sepsis_labs_w_sepsis_flags %>%
+  select(hospitalization_id, time, starts_with("qualifying")) %>% 
+  pivot_longer(cols =starts_with("qualifying"), names_prefix = "qualifying_", names_to = "sepsis_criteria") %>%
+  filter(value ==1) %>%
+  select(-value) %>%
+  rbind(
+    long_sepsis_vasoactives %>%
+      select(hospitalization_id, time, qualifying_vasoactive_start) %>%
+      filter(qualifying_vasoactive_start ==1) %>%
+      mutate(sepsis_criteria = "vasopressor") %>%
+      select(-qualifying_vasoactive_start)
+  ) %>%
+  rbind(
+    long_sepsis_IMV %>%
+      select(hospitalization_id, time, qualifying_vent_start) %>%
+      filter(qualifying_vent_start == 1) %>%
+      mutate(sepsis_criteria = "invasive mechanical ventilation") %>% 
+      select(-qualifying_vent_start)
+  ) %>%
+  arrange(hospitalization_id, time) %>%
+  group_by(hospitalization_id) %>%
+  mutate(first_sepsis_time = min(time),
+         first_sespsis_criteria = ifelse(time == first_sepsis_time, sepsis_criteria, NA)) %>%
+  distinct()
+
+first_sepsis_times <- sepsis_times %>%
+  group_by(hospitalization_id, sepsis_criteria) %>%
+  arrange(hospitalization_id, sepsis_criteria, time) %>%
+  filter(row_number() == 1)
+
+sepsis_case_id <- first_sepsis_times %>%
+  pull(hospitalization_id) %>% unique()
+```
+
+# Write out sepsis summary dataset 
+```{r}
+wide_sepsis_times <- first_sepsis_times %>%
+  select(-first_sepsis_time, - first_sespsis_criteria) %>%
+  pivot_wider(names_from = "sepsis_criteria", values_from = "time")
+```
+
+```{r}
+write_parquet(wide_sepsis_times, file.path(tables_path, "sepsis_case_summary.parquet"))
+```
+
